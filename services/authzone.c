@@ -117,6 +117,8 @@ static int xfr_start_probe(struct auth_xfer* xfr, struct module_env* env,
 /** copy the master addresses from the task_probe lookups to the allow_notify
  * list of masters */
 static void probe_copy_masters_for_allow_notify(struct auth_xfer* xfr);
+/** free the masters list */
+static void auth_free_masters(struct auth_master* list);
 /** delete xfer structure (not its tree entry) */
 void auth_xfer_delete(struct auth_xfer* xfr);
 
@@ -2293,8 +2295,7 @@ auth_zones_cfg(struct auth_zones* az, struct config_auth* c)
 		}
 		/* Pick up allow notify entries, early. This works for
 		 * addresses and netblocks. */
-		if(!x->allow_notify_list)
-			probe_copy_masters_for_allow_notify(x);
+		probe_copy_masters_for_allow_notify(x);
 		lock_basic_unlock(&x->lock);
 	}
 
@@ -2356,12 +2357,80 @@ az_delete_deleted_zones(struct auth_zones* az)
 	lock_rw_unlock(&az->lock);
 }
 
+/** free the master lists of the xfers, so that applying the config again,
+ * on reload, does not append to the lists of the previous config */
+static void
+az_clear_xfer_masters(struct auth_zones* az)
+{
+	struct auth_xfer* x;
+	lock_rw_wrlock(&az->lock);
+	RBTREE_FOR(x, struct auth_xfer*, &az->xtree) {
+		lock_basic_lock(&x->lock);
+		auth_free_masters(x->task_probe->masters);
+		x->task_probe->masters = NULL;
+		x->task_probe->scan_specific = NULL;
+		x->task_probe->scan_target = NULL;
+		x->task_probe->scan_addr = NULL;
+		x->task_probe->lookup_target = NULL;
+		auth_free_masters(x->task_transfer->masters);
+		x->task_transfer->masters = NULL;
+		x->task_transfer->scan_specific = NULL;
+		x->task_transfer->scan_target = NULL;
+		x->task_transfer->scan_addr = NULL;
+		x->task_transfer->lookup_target = NULL;
+		x->task_transfer->master = NULL;
+		auth_free_masters(x->allow_notify_list);
+		x->allow_notify_list = NULL;
+		lock_basic_unlock(&x->lock);
+	}
+	lock_rw_unlock(&az->lock);
+}
+
+/** delete the xfers of zones that no longer have a master or url */
+static void
+az_delete_masterless_xfers(struct auth_zones* az)
+{
+	struct auth_zone* z;
+	struct auth_zone* delete_list = NULL, *next;
+	struct auth_xfer* xfr;
+	int masterless;
+	lock_rw_wrlock(&az->lock);
+	RBTREE_FOR(z, struct auth_zone*, &az->ztree) {
+		xfr = auth_xfer_find(az, z->name, z->namelen, z->dclass);
+		if(!xfr)
+			continue;
+		lock_basic_lock(&xfr->lock);
+		masterless = (!xfr->task_probe->masters &&
+			!xfr->task_transfer->masters);
+		lock_basic_unlock(&xfr->lock);
+		if(!masterless)
+			continue;
+		lock_rw_wrlock(&z->lock);
+		z->zone_is_slave = 0;
+		z->delete_next = delete_list;
+		delete_list = z;
+		lock_rw_unlock(&z->lock);
+	}
+	z = delete_list;
+	while(z) {
+		next = z->delete_next;
+		xfr = auth_xfer_find(az, z->name, z->namelen, z->dclass);
+		if(xfr) {
+			(void)rbtree_delete(&az->xtree, &xfr->node);
+			auth_xfer_delete(xfr);
+		}
+		z = next;
+	}
+	lock_rw_unlock(&az->lock);
+}
+
 int auth_zones_apply_cfg(struct auth_zones* az, struct config_file* cfg,
 	int setup, int readauth, int* is_rpz, struct module_env* env,
 	struct module_stack* mods)
 {
 	struct config_auth* p;
 	az_setall_deleted(az);
+	az_clear_xfer_masters(az);
 	for(p = cfg->auths; p; p = p->next) {
 		if(!p->name || p->name[0] == 0) {
 			log_warn("auth-zone without a name, skipped");
@@ -2374,6 +2443,7 @@ int auth_zones_apply_cfg(struct auth_zones* az, struct config_file* cfg,
 		}
 	}
 	az_delete_deleted_zones(az);
+	az_delete_masterless_xfers(az);
 	if(readauth) {
 		if(!auth_zones_read_zones(az, cfg, env, mods))
 			return 0;

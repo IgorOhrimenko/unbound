@@ -1059,6 +1059,539 @@ authzone_chunkline_count_parens_test(void)
 	sldns_buffer_free(buf);
 }
 
+/** zone name for the master list tests */
+static const char* mlist_zone = "example.com";
+
+/** expected contents of one entry in a master list */
+struct mlist_exp {
+	/** the host string of the master */
+	const char* host;
+	/** the entry is an url */
+	int http;
+	/** the entry is an allow-notify entry */
+	int allow_notify;
+};
+
+/** create the auth zones and the config for the master list tests */
+static void
+authtest_mlist_setup(struct auth_zones** az, struct config_file** cfg)
+{
+	*az = auth_zones_create();
+	if(!*az) fatal_exit("out of memory");
+	*cfg = config_create();
+	if(!*cfg) fatal_exit("out of memory");
+}
+
+/** delete the auth zones and the config of the master list tests */
+static void
+authtest_mlist_teardown(struct auth_zones* az, struct config_file* cfg)
+{
+	auth_zones_delete(az);
+	config_delete(cfg);
+}
+
+/** add an auth-zone block to the config, strings are NULL when absent */
+static void
+authtest_cfg_block(struct config_file* cfg, const char* name,
+	const char* url, const char* master, const char* allow_notify)
+{
+	struct config_auth* c = (struct config_auth*)calloc(1, sizeof(*c));
+	struct config_auth** last = &cfg->auths;
+	if(!c) fatal_exit("out of memory");
+	c->name = strdup(name);
+	if(!c->name) fatal_exit("out of memory");
+	if(url && !cfg_strlist_insert(&c->urls, strdup(url)))
+		fatal_exit("out of memory");
+	if(master && !cfg_strlist_insert(&c->masters, strdup(master)))
+		fatal_exit("out of memory");
+	if(allow_notify &&
+		!cfg_strlist_insert(&c->allow_notify, strdup(allow_notify)))
+		fatal_exit("out of memory");
+	while(*last)
+		last = &(*last)->next;
+	*last = c;
+}
+
+/** apply the config blocks, as a (re)load does, and delete them */
+static void
+authtest_cfg_apply(struct auth_zones* az, struct config_file* cfg)
+{
+	int is_rpz = 0;
+	unit_assert(auth_zones_apply_cfg(az, cfg, 0, 0, &is_rpz, NULL, NULL));
+	config_delauths(cfg->auths);
+	cfg->auths = NULL;
+}
+
+/** find the xfer of the zone */
+static struct auth_xfer*
+authtest_find_xfer(struct auth_zones* az, const char* name)
+{
+	size_t nmlen;
+	uint8_t* nm = sldns_str2wire_dname(name, &nmlen);
+	struct auth_xfer* x;
+	if(!nm) fatal_exit("out of memory");
+	x = auth_xfer_find(az, nm, nmlen, LDNS_RR_CLASS_IN);
+	free(nm);
+	return x;
+}
+
+/** find the zone */
+static struct auth_zone*
+authtest_find_zone(struct auth_zones* az, const char* name)
+{
+	size_t nmlen;
+	uint8_t* nm = sldns_str2wire_dname(name, &nmlen);
+	struct auth_zone* z;
+	if(!nm) fatal_exit("out of memory");
+	z = auth_zone_find(az, nm, nmlen, LDNS_RR_CLASS_IN);
+	free(nm);
+	return z;
+}
+
+/** check that the master list has exactly the expected entries */
+static void
+authtest_check_masters(struct auth_master* list, const struct mlist_exp* exp,
+	size_t num)
+{
+	size_t i;
+	for(i=0; i<num; i++) {
+		unit_assert(list);
+		unit_assert(list->host);
+		unit_assert(strcmp(list->host, exp[i].host) == 0);
+		unit_assert(list->http == exp[i].http);
+		unit_assert(list->allow_notify == exp[i].allow_notify);
+		list = list->next;
+	}
+	unit_assert(!list);
+}
+
+/** check the probe and transfer lists of the zone, return the xfer */
+static struct auth_xfer*
+authtest_check_xfer(struct auth_zones* az, const char* name,
+	const struct mlist_exp* probe, size_t nprobe,
+	const struct mlist_exp* transfer, size_t ntransfer)
+{
+	struct auth_xfer* x = authtest_find_xfer(az, name);
+	unit_assert(x);
+	authtest_check_masters(x->task_probe->masters, probe, nprobe);
+	authtest_check_masters(x->task_transfer->masters, transfer, ntransfer);
+	return x;
+}
+
+/** check the url entry fields */
+static void
+authtest_check_url(struct auth_master* m, const char* host,
+	const char* file, int port, int ssl)
+{
+	unit_assert(m);
+	unit_assert(m->http);
+	unit_assert(m->host && strcmp(m->host, host) == 0);
+	unit_assert(m->file && strcmp(m->file, file) == 0);
+	unit_assert(m->port == port);
+	unit_assert(m->ssl == ssl);
+}
+
+/** allocate an address for the list of a master, as lookups do */
+static struct auth_addr*
+authtest_new_addr(void)
+{
+	struct auth_addr* a = (struct auth_addr*)calloc(1, sizeof(*a));
+	if(!a) fatal_exit("out of memory");
+	return a;
+}
+
+/** Test that applying the same config again keeps the master lists */
+static void
+authzone_reapply_same_test(void)
+{
+	struct auth_zones* az;
+	struct config_file* cfg;
+	const struct mlist_exp exp[] = { {"192.0.2.1", 0, 0} };
+	int i;
+	if(vbmp) printf("Testing reapply of the same config\n");
+	authtest_mlist_setup(&az, &cfg);
+	for(i=0; i<4; i++) {
+		authtest_cfg_block(cfg, mlist_zone, NULL, "192.0.2.1", NULL);
+		authtest_cfg_apply(az, cfg);
+	}
+	authtest_check_xfer(az, mlist_zone, exp, 1, exp, 1);
+	authtest_mlist_teardown(az, cfg);
+}
+
+/** Test that a changed master replaces the old master */
+static void
+authzone_reapply_master_test(void)
+{
+	struct auth_zones* az;
+	struct config_file* cfg;
+	const struct mlist_exp exp[] = { {"192.0.2.2", 0, 0} };
+	if(vbmp) printf("Testing reapply with a changed master\n");
+	authtest_mlist_setup(&az, &cfg);
+	authtest_cfg_block(cfg, mlist_zone, NULL, "192.0.2.1", NULL);
+	authtest_cfg_apply(az, cfg);
+	authtest_cfg_block(cfg, mlist_zone, NULL, "192.0.2.2", NULL);
+	authtest_cfg_apply(az, cfg);
+	authtest_check_xfer(az, mlist_zone, exp, 1, exp, 1);
+	authtest_mlist_teardown(az, cfg);
+}
+
+/** Test that a changed allow-notify replaces the old one */
+static void
+authzone_reapply_allow_notify_test(void)
+{
+	struct auth_zones* az;
+	struct config_file* cfg;
+	const struct mlist_exp exp[] = {
+		{"192.0.2.1", 0, 0}, {"192.0.2.54", 0, 1} };
+	if(vbmp) printf("Testing reapply with a changed allow-notify\n");
+	authtest_mlist_setup(&az, &cfg);
+	authtest_cfg_block(cfg, mlist_zone, NULL, "192.0.2.1", "192.0.2.53");
+	authtest_cfg_apply(az, cfg);
+	authtest_cfg_block(cfg, mlist_zone, NULL, "192.0.2.1", "192.0.2.54");
+	authtest_cfg_apply(az, cfg);
+	authtest_check_xfer(az, mlist_zone, exp, 2, exp, 2);
+	authtest_mlist_teardown(az, cfg);
+}
+
+/** Test that a changed url replaces the old url */
+static void
+authzone_reapply_url_test(void)
+{
+	struct auth_zones* az;
+	struct config_file* cfg;
+	struct auth_xfer* x;
+	const struct mlist_exp probe[] = { {"192.0.2.1", 0, 0} };
+	const struct mlist_exp transfer[] = {
+		{"u2.example.net", 1, 0}, {"192.0.2.1", 0, 0} };
+	if(vbmp) printf("Testing reapply with a changed url\n");
+	authtest_mlist_setup(&az, &cfg);
+	authtest_cfg_block(cfg, mlist_zone, "http://u1.example.net:8080/z1",
+		"192.0.2.1", NULL);
+	authtest_cfg_apply(az, cfg);
+	authtest_cfg_block(cfg, mlist_zone, "https://u2.example.net/z2",
+		"192.0.2.1", NULL);
+	authtest_cfg_apply(az, cfg);
+	x = authtest_check_xfer(az, mlist_zone, probe, 1, transfer, 2);
+	authtest_check_url(x->task_transfer->masters, "u2.example.net", "z2",
+		443, 1);
+	authtest_mlist_teardown(az, cfg);
+}
+
+/** Test the lists after the first apply of url, master and allow-notify */
+static void
+authzone_apply_first_test(void)
+{
+	struct auth_zones* az;
+	struct config_file* cfg;
+	struct auth_xfer* x;
+	const struct mlist_exp probe[] = {
+		{"192.0.2.1", 0, 0}, {"192.0.2.53", 0, 1} };
+	const struct mlist_exp transfer[] = {
+		{"u.example.net", 1, 0}, {"192.0.2.1", 0, 0},
+		{"192.0.2.53", 0, 1} };
+	if(vbmp) printf("Testing first apply of url, master, allow-notify\n");
+	authtest_mlist_setup(&az, &cfg);
+	authtest_cfg_block(cfg, mlist_zone, "http://u.example.net/z",
+		"192.0.2.1", "192.0.2.53");
+	authtest_cfg_apply(az, cfg);
+	x = authtest_check_xfer(az, mlist_zone, probe, 2, transfer, 3);
+	authtest_check_url(x->task_transfer->masters, "u.example.net", "z",
+		80, 0);
+	authtest_mlist_teardown(az, cfg);
+}
+
+/** Test that two blocks for one zone keep their lists when applied again */
+static void
+authzone_reapply_two_blocks_test(void)
+{
+	struct auth_zones* az;
+	struct config_file* cfg;
+	struct mlist_exp exp[2];
+	struct auth_xfer* x;
+	int a_first;
+	if(vbmp) printf("Testing reapply of two blocks for one zone\n");
+	authtest_mlist_setup(&az, &cfg);
+	authtest_cfg_block(cfg, mlist_zone, NULL, "192.0.2.1", NULL);
+	authtest_cfg_block(cfg, mlist_zone, NULL, "192.0.2.2", NULL);
+	authtest_cfg_apply(az, cfg);
+	/* the order of the first apply is what has to be kept */
+	x = authtest_find_xfer(az, mlist_zone);
+	unit_assert(x);
+	unit_assert(x->task_probe->masters);
+	a_first = (strcmp(x->task_probe->masters->host, "192.0.2.1") == 0);
+	memset(exp, 0, sizeof(exp));
+	exp[0].host = a_first?"192.0.2.1":"192.0.2.2";
+	exp[1].host = a_first?"192.0.2.2":"192.0.2.1";
+	authtest_check_xfer(az, mlist_zone, exp, 2, exp, 2);
+	authtest_cfg_block(cfg, mlist_zone, NULL, "192.0.2.1", NULL);
+	authtest_cfg_block(cfg, mlist_zone, NULL, "192.0.2.2", NULL);
+	authtest_cfg_apply(az, cfg);
+	authtest_check_xfer(az, mlist_zone, exp, 2, exp, 2);
+	authtest_mlist_teardown(az, cfg);
+}
+
+/** Test that the allow notify list follows a changed allow-notify */
+static void
+authzone_reapply_allow_notify_list_test(void)
+{
+	struct auth_zones* az;
+	struct config_file* cfg;
+	struct auth_xfer* x;
+	const struct mlist_exp exp[] = {
+		{"192.0.2.1", 0, 0}, {"192.0.2.54", 0, 1} };
+	if(vbmp) printf("Testing allow notify list, changed allow-notify\n");
+	authtest_mlist_setup(&az, &cfg);
+	authtest_cfg_block(cfg, mlist_zone, NULL, "192.0.2.1", "192.0.2.53");
+	authtest_cfg_apply(az, cfg);
+	authtest_cfg_block(cfg, mlist_zone, NULL, "192.0.2.1", "192.0.2.54");
+	authtest_cfg_apply(az, cfg);
+	x = authtest_find_xfer(az, mlist_zone);
+	unit_assert(x);
+	authtest_check_masters(x->allow_notify_list, exp, 2);
+	authtest_mlist_teardown(az, cfg);
+}
+
+/** Test that the allow notify list follows a changed url */
+static void
+authzone_reapply_url_allow_notify_list_test(void)
+{
+	struct auth_zones* az;
+	struct config_file* cfg;
+	struct auth_xfer* x;
+	const struct mlist_exp exp[] = {
+		{"192.0.2.1", 0, 0}, {"u2.example.net", 1, 0} };
+	if(vbmp) printf("Testing allow notify list, changed url\n");
+	authtest_mlist_setup(&az, &cfg);
+	authtest_cfg_block(cfg, mlist_zone, "http://u1.example.net/z1",
+		"192.0.2.1", NULL);
+	authtest_cfg_apply(az, cfg);
+	authtest_cfg_block(cfg, mlist_zone, "http://u2.example.net/z2",
+		"192.0.2.1", NULL);
+	authtest_cfg_apply(az, cfg);
+	x = authtest_find_xfer(az, mlist_zone);
+	unit_assert(x);
+	authtest_check_masters(x->allow_notify_list, exp, 2);
+	authtest_mlist_teardown(az, cfg);
+}
+
+/** Test that looked up addresses of a named master are dropped */
+static void
+authzone_reapply_lookup_addrs_test(void)
+{
+	struct auth_zones* az;
+	struct config_file* cfg;
+	struct auth_xfer* x;
+	const struct mlist_exp exp[] = { {"ns.example.net", 0, 0} };
+	if(vbmp) printf("Testing reapply with looked up master addresses\n");
+	authtest_mlist_setup(&az, &cfg);
+	authtest_cfg_block(cfg, mlist_zone, NULL, "ns.example.net", NULL);
+	authtest_cfg_apply(az, cfg);
+	x = authtest_find_xfer(az, mlist_zone);
+	unit_assert(x);
+	unit_assert(x->task_probe->masters);
+	unit_assert(x->task_transfer->masters);
+	unit_assert(x->allow_notify_list);
+	/* as if the lookup of the name has found an address */
+	x->task_probe->masters->list = authtest_new_addr();
+	x->task_transfer->masters->list = authtest_new_addr();
+	x->allow_notify_list->list = authtest_new_addr();
+	authtest_cfg_block(cfg, mlist_zone, NULL, "ns.example.net", NULL);
+	authtest_cfg_apply(az, cfg);
+	x = authtest_check_xfer(az, mlist_zone, exp, 1, exp, 1);
+	authtest_check_masters(x->allow_notify_list, exp, 1);
+	unit_assert(!x->task_probe->masters->list);
+	unit_assert(!x->task_transfer->masters->list);
+	unit_assert(!x->allow_notify_list->list);
+	authtest_mlist_teardown(az, cfg);
+}
+
+/** Test that pointers into the freed lists are reset */
+static void
+authzone_reapply_reset_pointers_test(void)
+{
+	struct auth_zones* az;
+	struct config_file* cfg;
+	struct auth_xfer* x;
+	struct auth_probe* p;
+	struct auth_transfer* t;
+	if(vbmp) printf("Testing reapply resets pointers into the lists\n");
+	authtest_mlist_setup(&az, &cfg);
+	authtest_cfg_block(cfg, mlist_zone, NULL, "192.0.2.1", NULL);
+	authtest_cfg_apply(az, cfg);
+	x = authtest_find_xfer(az, mlist_zone);
+	unit_assert(x);
+	p = x->task_probe;
+	t = x->task_transfer;
+	/* point the work in progress at the entries that are to be freed */
+	p->masters->list = authtest_new_addr();
+	t->masters->list = authtest_new_addr();
+	p->scan_specific = p->masters;
+	p->scan_target = p->masters;
+	p->scan_addr = p->masters->list;
+	p->lookup_target = p->masters;
+	t->scan_specific = t->masters;
+	t->scan_target = t->masters;
+	t->scan_addr = t->masters->list;
+	t->lookup_target = t->masters;
+	t->master = t->masters;
+	authtest_cfg_block(cfg, mlist_zone, NULL, "192.0.2.1", NULL);
+	authtest_cfg_apply(az, cfg);
+	x = authtest_find_xfer(az, mlist_zone);
+	unit_assert(x);
+	unit_assert(!x->task_probe->scan_specific);
+	unit_assert(!x->task_probe->scan_target);
+	unit_assert(!x->task_probe->scan_addr);
+	unit_assert(!x->task_probe->lookup_target);
+	unit_assert(!x->task_transfer->scan_specific);
+	unit_assert(!x->task_transfer->scan_target);
+	unit_assert(!x->task_transfer->scan_addr);
+	unit_assert(!x->task_transfer->lookup_target);
+	unit_assert(!x->task_transfer->master);
+	authtest_mlist_teardown(az, cfg);
+}
+
+/** Test that a zone without masters is no longer a secondary zone */
+static void
+authzone_reapply_no_masters_test(void)
+{
+	struct auth_zones* az;
+	struct config_file* cfg;
+	struct auth_zone* z;
+	const struct mlist_exp exp[] = { {"192.0.2.1", 0, 0} };
+	if(vbmp) printf("Testing reapply of a zone without masters\n");
+	authtest_mlist_setup(&az, &cfg);
+	authtest_cfg_block(cfg, mlist_zone, NULL, "192.0.2.1", NULL);
+	authtest_cfg_apply(az, cfg);
+	unit_assert(authtest_find_xfer(az, mlist_zone));
+	z = authtest_find_zone(az, mlist_zone);
+	unit_assert(z);
+	unit_assert(z->zone_is_slave == 1);
+	authtest_cfg_block(cfg, mlist_zone, NULL, NULL, NULL);
+	authtest_cfg_apply(az, cfg);
+	unit_assert(!authtest_find_xfer(az, mlist_zone));
+	z = authtest_find_zone(az, mlist_zone);
+	unit_assert(z);
+	unit_assert(z->zone_is_slave == 0);
+	authtest_cfg_block(cfg, mlist_zone, NULL, "192.0.2.1", NULL);
+	authtest_cfg_apply(az, cfg);
+	authtest_check_xfer(az, mlist_zone, exp, 1, exp, 1);
+	z = authtest_find_zone(az, mlist_zone);
+	unit_assert(z);
+	unit_assert(z->zone_is_slave == 1);
+	authtest_mlist_teardown(az, cfg);
+}
+
+/** Test that a zone with only an url stays a secondary zone */
+static void
+authzone_reapply_url_only_test(void)
+{
+	struct auth_zones* az;
+	struct config_file* cfg;
+	struct auth_zone* z;
+	struct auth_xfer* x;
+	const struct mlist_exp transfer[] = { {"u.example.net", 1, 0} };
+	if(vbmp) printf("Testing reapply of a zone with only an url\n");
+	authtest_mlist_setup(&az, &cfg);
+	authtest_cfg_block(cfg, mlist_zone, "http://u.example.net/z", NULL,
+		NULL);
+	authtest_cfg_apply(az, cfg);
+	authtest_cfg_block(cfg, mlist_zone, "http://u.example.net/z", NULL,
+		NULL);
+	authtest_cfg_apply(az, cfg);
+	x = authtest_check_xfer(az, mlist_zone, NULL, 0, transfer, 1);
+	unit_assert(x);
+	z = authtest_find_zone(az, mlist_zone);
+	unit_assert(z);
+	unit_assert(z->zone_is_slave == 1);
+	authtest_mlist_teardown(az, cfg);
+}
+
+/** Test that a zone with a block without masters stays a secondary */
+static void
+authzone_reapply_mixed_blocks_test(void)
+{
+	struct auth_zones* az;
+	struct config_file* cfg;
+	struct auth_zone* z;
+	const struct mlist_exp exp[] = { {"192.0.2.1", 0, 0} };
+	int i;
+	if(vbmp) printf("Testing reapply of a block without masters\n");
+	authtest_mlist_setup(&az, &cfg);
+	for(i=0; i<2; i++) {
+		authtest_cfg_block(cfg, mlist_zone, NULL, "192.0.2.1", NULL);
+		authtest_cfg_block(cfg, mlist_zone, NULL, NULL, NULL);
+		authtest_cfg_apply(az, cfg);
+	}
+	authtest_check_xfer(az, mlist_zone, exp, 1, exp, 1);
+	z = authtest_find_zone(az, mlist_zone);
+	unit_assert(z);
+	unit_assert(z->zone_is_slave == 1);
+	authtest_mlist_teardown(az, cfg);
+}
+
+/** Test that several zones lose their masters, and the others keep theirs */
+static void
+authzone_reapply_many_no_masters_test(void)
+{
+	struct auth_zones* az;
+	struct config_file* cfg;
+	struct auth_zone* z;
+	const struct mlist_exp exp[] = { {"192.0.2.1", 0, 0} };
+	const char* lost[] = { "a.example.com", "c.example.com",
+		"d.example.com" };
+	size_t i;
+	if(vbmp) printf("Testing reapply of several zones without masters\n");
+	authtest_mlist_setup(&az, &cfg);
+	authtest_cfg_block(cfg, "a.example.com", NULL, "192.0.2.1", NULL);
+	authtest_cfg_block(cfg, "b.example.com", NULL, "192.0.2.1", NULL);
+	authtest_cfg_block(cfg, "c.example.com", NULL, "192.0.2.1", NULL);
+	authtest_cfg_block(cfg, "d.example.com", NULL, "192.0.2.1", NULL);
+	authtest_cfg_apply(az, cfg);
+	authtest_cfg_block(cfg, "a.example.com", NULL, NULL, NULL);
+	authtest_cfg_block(cfg, "b.example.com", NULL, "192.0.2.1", NULL);
+	authtest_cfg_block(cfg, "c.example.com", NULL, NULL, NULL);
+	authtest_cfg_block(cfg, "d.example.com", NULL, NULL, NULL);
+	authtest_cfg_apply(az, cfg);
+	for(i=0; i<sizeof(lost)/sizeof(lost[0]); i++) {
+		unit_assert(!authtest_find_xfer(az, lost[i]));
+		z = authtest_find_zone(az, lost[i]);
+		unit_assert(z);
+		unit_assert(z->zone_is_slave == 0);
+	}
+	authtest_check_xfer(az, "b.example.com", exp, 1, exp, 1);
+	z = authtest_find_zone(az, "b.example.com");
+	unit_assert(z);
+	unit_assert(z->zone_is_slave == 1);
+	authtest_mlist_teardown(az, cfg);
+}
+
+/** Test the allow notify list of a zone with two blocks */
+static void
+authzone_reapply_two_blocks_allow_notify_list_test(void)
+{
+	struct auth_zones* az;
+	struct config_file* cfg;
+	struct auth_xfer* x;
+	struct mlist_exp exp[2];
+	int i;
+	if(vbmp) printf("Testing allow notify list of two blocks\n");
+	authtest_mlist_setup(&az, &cfg);
+	memset(exp, 0, sizeof(exp));
+	for(i=0; i<2; i++) {
+		authtest_cfg_block(cfg, mlist_zone, NULL, "192.0.2.1", NULL);
+		authtest_cfg_block(cfg, mlist_zone, NULL, "192.0.2.2", NULL);
+		authtest_cfg_apply(az, cfg);
+		x = authtest_find_xfer(az, mlist_zone);
+		unit_assert(x);
+		unit_assert(x->task_probe->masters);
+		unit_assert(x->task_probe->masters->next);
+		exp[0].host = x->task_probe->masters->host;
+		exp[1].host = x->task_probe->masters->next->host;
+		authtest_check_masters(x->allow_notify_list, exp, 2);
+	}
+	authtest_mlist_teardown(az, cfg);
+}
+
 /** test authzone code */
 void 
 authzone_test(void)
@@ -1069,4 +1602,19 @@ authzone_test(void)
 	authzone_read_test();
 	authzone_query_test();
 	authzone_chunkline_count_parens_test();
+	authzone_reapply_same_test();
+	authzone_reapply_master_test();
+	authzone_reapply_allow_notify_test();
+	authzone_reapply_url_test();
+	authzone_apply_first_test();
+	authzone_reapply_two_blocks_test();
+	authzone_reapply_allow_notify_list_test();
+	authzone_reapply_url_allow_notify_list_test();
+	authzone_reapply_lookup_addrs_test();
+	authzone_reapply_reset_pointers_test();
+	authzone_reapply_no_masters_test();
+	authzone_reapply_url_only_test();
+	authzone_reapply_mixed_blocks_test();
+	authzone_reapply_many_no_masters_test();
+	authzone_reapply_two_blocks_allow_notify_list_test();
 }
